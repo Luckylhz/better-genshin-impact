@@ -7,18 +7,12 @@ using BetterGenshinImpact.GameTask.Common.BgiVision;
 using BetterGenshinImpact.GameTask.Common.Element.Assets;
 using BetterGenshinImpact.GameTask.Model.Area;
 using Microsoft.Extensions.Logging;
-using BetterGenshinImpact.Genshin.Paths;
 using System.IO;
 using System.Text.RegularExpressions;
-using System.Threading.Channels;
 using Microsoft.Win32;
-using System.Windows.Documents;
 using System.Linq;
 using System.Threading;
-using System.Runtime.InteropServices;
 using System.Text;
-using BetterGenshinImpact.Core.Recognition.OpenCv;
-using BetterGenshinImpact.Helpers.Extensions;
 using Vanara.PInvoke;
 
 namespace BetterGenshinImpact.GameTask.GameLoading;
@@ -32,6 +26,9 @@ public class GameLoadingTrigger : ITaskTrigger
     public int Priority => 999;
 
     public bool IsExclusive => false;
+
+    public bool IsBiliJudged = false;
+    public bool IsBili = false;
 
     public bool IsBackgroundRunning => true;
 
@@ -56,6 +53,7 @@ public class GameLoadingTrigger : ITaskTrigger
     private string FileName = "";
 
     private bool biliLoginClicked = false;
+    private (double x1080, double y1080)? lastAgreementClickPos = null;
 
     public GameLoadingTrigger()
     {
@@ -239,43 +237,47 @@ public class GameLoadingTrigger : ITaskTrigger
             IsEnabled = false;
             return;
         }
-
-        if (Bv.IsInMainUi(content.CaptureRectArea) || Bv.IsInAnyClosableUi(content.CaptureRectArea))
+        // 成功进入游戏判断    
+        if (Bv.IsInMainUi(content.CaptureRectArea) || Bv.IsInAnyClosableUi(content.CaptureRectArea) || Bv.IsInDomain(content.CaptureRectArea))
         {
+            _logger.LogInformation("已进入游戏");
             IsEnabled = false;
             return;
         }
 
-        // B服判断逻辑
-        bool isBili = false;
-        try
+        // B服判断
+        if (!IsBiliJudged)
         {
-            var exePath = _config.InstallPath;
-            if (!string.IsNullOrEmpty(exePath))
+            try
             {
-                var configIni = Path.Combine(Path.GetDirectoryName(exePath)!, "config.ini");
-                if (File.Exists(configIni))
+                var exePath = _config.InstallPath;
+                if (!string.IsNullOrEmpty(exePath))
                 {
-                    var lines = File.ReadAllLines(configIni);
-                    foreach (var line in lines)
+                    var configIni = Path.Combine(Path.GetDirectoryName(exePath)!, "config.ini");
+                    if (File.Exists(configIni))
                     {
-                        var kv = line.Trim();
-                        if (kv.StartsWith("channel=") && kv.EndsWith("14"))
+                        var lines = File.ReadAllLines(configIni);
+                        foreach (var line in lines)
                         {
-                            isBili = true;
-                            break;
+                            var kv = line.Trim();
+                            if (kv.StartsWith("channel=") && kv.EndsWith("14"))
+                            {
+                                IsBili = true;
+                                break;
+                            }
                         }
                     }
                 }
             }
-        }
-        catch (Exception ex)
-        {
-            TaskControl.Logger.LogWarning("B服判断异常: " + ex.Message);
+            catch (Exception ex)
+            {
+                TaskControl.Logger.LogWarning("B服判断异常: " + ex.Message);
+            }
+            IsBiliJudged = true;
         }
 
         // 官服流程：先识别并点击顶号或切号的后一次“进入游戏”弹窗按钮
-        if (!isBili)
+        if (!IsBili)
         {
             var extraEnterGameBtn = content.CaptureRectArea.Find(_assets.ChooseEnterGameRo);
             if (!extraEnterGameBtn.IsEmpty())
@@ -285,75 +287,49 @@ public class GameLoadingTrigger : ITaskTrigger
             }
         }
 
-        // 官服流程：点击进入游戏按钮（作为外层包装）
-        using var ra = content.CaptureRectArea.Find(_assets.EnterGameRo);
+        // 点击进入游戏按钮
+        var ra = content.CaptureRectArea.Find(_assets.EnterGameRo);
+
         if (!ra.IsEmpty())
         {
-            if (isBili)
+            TaskContext.Instance().PostMessageSimulator.LeftButtonClickBackground();
+            biliLoginClicked = true;
+            return;
+        }
+
+        // 只有在"进入游戏"按钮未出现时，才进行B服登录处理
+        if (IsBili && !biliLoginClicked)
+        {
+            // B服流程：处理登录窗口
+            var process = Process.GetProcessesByName("YuanShen").FirstOrDefault();
+            var (loginWindow, windowType) = GetBiliLoginWindow(process);
+
+            if (process != null && loginWindow != IntPtr.Zero)
             {
-                // B服流程：处理登录窗口
-                if (!biliLoginClicked)
+                if (windowType.Contains("协议"))
                 {
-                    int failCount = 0;
-                    while (true)
-                    {
-                        var process = Process.GetProcessesByName("YuanShen").FirstOrDefault();
-                        var (loginWindow, windowType) = GetBiliLoginWindow(process);
-                        if (process != null && loginWindow != IntPtr.Zero)
-                        {
-                            if (windowType.Contains("协议"))
-                            {
-                                // 点击协议窗口
-                                GameCaptureRegion.GameRegion1080PPosClick(1000, 600);
-                                Thread.Sleep(2000);
-
-                                // 检查窗口是否还存在
-                                var (remainingWindow, remainingType) = GetBiliLoginWindow(process);
-                                if (remainingWindow == IntPtr.Zero || !remainingType.Contains("协议"))
-                                {
-                                    // 协议窗口已消失，继续等待登录窗口
-                                    continue;
-                                }
-                                failCount++;
-                                continue;
-                            }
-                            if (windowType.Contains("登录"))
-                            {
-                                // 点击登录窗口
-                                GameCaptureRegion.GameRegion1080PPosClick(960, 630);
-                                Thread.Sleep(2000);
-
-                                // 检查窗口是否还存在
-                                var (remainingWindow, remainingType) = GetBiliLoginWindow(process);
-                                if (remainingWindow == IntPtr.Zero)
-                                {
-                                    biliLoginClicked = true;
-                                    break; // 登录成功，跳出循环
-                                }
-                                failCount++;
-                                continue;
-                            }
-                        }
-
-                        if (failCount > 20)
-                        {
-                            break;
-                        }
-
-                        Thread.Sleep(500);
-                    }
+                    GameCaptureRegion.GameRegion1080PPosClick(1030, 615);
                 }
 
-                Thread.Sleep(5000);
-                ClickEnterGameButton();
-            }
-            else
-            {
-                // 官服流程：直接点击进入游戏按钮
-                ClickEnterGameButton();
-            }
+                if (windowType.Contains("登录"))
+                {
+                    Thread.Sleep(2000);
+                    GameCaptureRegion.GameRegion1080PPosClick(960, 630);
+                    Thread.Sleep(2000);
 
-            return;
+                    // 检查窗口是否还存在
+                    var (remainingWindow, remainingType) = GetBiliLoginWindow(process);
+                    if (remainingWindow == IntPtr.Zero)
+                    {
+                        _logger.LogInformation("B服登录完成，准备进入游戏");
+                        // 添加延时确保窗口完全消失
+                        Thread.Sleep(2000);
+                        // 点击屏幕尝试找回焦点
+                        TaskContext.Instance().PostMessageSimulator.LeftButtonClickBackground();
+                        biliLoginClicked = true;
+                    }
+                }
+            }
         }
 
         var wmRa = content.CaptureRectArea.Find(_assets.WelkinMoonRo);
@@ -376,7 +352,7 @@ public class GameLoadingTrigger : ITaskTrigger
         }
     }
 
-    // B服登录窗口检测(参考Login3rdParty)
+    // B服登录窗口检测
     private static (IntPtr windowHandle, string windowType) GetBiliLoginWindow(Process process)
     {
         IntPtr bHWnd = IntPtr.Zero;
@@ -394,7 +370,6 @@ public class GameLoadingTrigger : ITaskTrigger
                     User32.GetWindowText(hWnd, title, title.Capacity);
 
                     string titleText = title.ToString();
-                    // _logger.LogInformation($"窗口标题: {titleText}");
 
                     // 检查是否是B服登录窗口（通过标题匹配）
                     if (titleText.Contains("bilibili", StringComparison.OrdinalIgnoreCase))
@@ -445,10 +420,5 @@ public class GameLoadingTrigger : ITaskTrigger
         }, IntPtr.Zero);
 
         return (bHWnd, windowType);
-    }
-
-    private void ClickEnterGameButton()
-    {
-        TaskContext.Instance().PostMessageSimulator.LeftButtonClickBackground();
     }
 };

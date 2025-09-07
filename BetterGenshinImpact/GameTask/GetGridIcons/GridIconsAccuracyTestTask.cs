@@ -1,6 +1,11 @@
 using BetterGenshinImpact.Core.Recognition.OCR;
+using BetterGenshinImpact.Core.Simulator;
+using BetterGenshinImpact.GameTask.AutoArtifactSalvage;
+using BetterGenshinImpact.GameTask.Common.Job;
 using BetterGenshinImpact.GameTask.Model.Area;
 using BetterGenshinImpact.GameTask.Model.GameUI;
+using BetterGenshinImpact.Helpers.Extensions;
+using Fischless.WindowsInput;
 using Microsoft.Extensions.Logging;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
@@ -21,6 +26,7 @@ namespace BetterGenshinImpact.GameTask.GetGridIcons;
 public class GridIconsAccuracyTestTask : ISoloTask
 {
     private readonly ILogger logger = App.GetLogger<GetGridIconsTask>();
+    private readonly InputSimulator input = Simulation.SendInput;
 
     private CancellationToken ct;
 
@@ -36,25 +42,28 @@ public class GridIconsAccuracyTestTask : ISoloTask
         this.maxNumToTest = maxNumToTest;
     }
 
-    public async Task Start(CancellationToken ct)
+    /// <summary>
+    /// 加载图标识别模型
+    /// </summary>
+    /// <param name="prototypes">原型向量</param>
+    /// <returns>推理会话</returns>
+    /// <exception cref="Exception"></exception>
+    public static InferenceSession LoadModel(out Dictionary<string, float[]> prototypes)
     {
-        this.ct = ct;
-
         #region 加载model
-        using var session = new InferenceSession(@".\GameTask\GetGridIcons\gridIcon.onnx"); // todo 所有数据炼好后放到onnx统一存放的位置去
+        var session = new InferenceSession(@".\Assets\Model\Item\gridIcon.onnx");
 
         var metadata = session.ModelMetadata;
 
         if (!metadata.CustomMetadataMap.TryGetValue("prefix_list", out string? prefixListJson))
         {
-            logger.LogError("模型文件缺少prefix_list");
-            return;
+            throw new Exception("模型文件缺少prefix_list");
         }
         List<string> prefixList = System.Text.Json.JsonSerializer.Deserialize<List<string>>(prefixListJson) ?? throw new Exception();   // 不预测前缀
         #endregion
         #region 加载原型向量
-        var allLines = File.ReadLines(@".\GameTask\GetGridIcons\训练集原型特征.csv").Skip(1);    // 跳过首行列名
-        Dictionary<string, float[]> prototypes = new Dictionary<string, float[]>();
+        var allLines = File.ReadLines(@".\Assets\Model\Item\items.csv").Skip(1);    // 跳过首行列名
+        prototypes = new Dictionary<string, float[]>();
         foreach (string line in allLines)
         {
             var columns = line.Split(",").ToArray();
@@ -65,30 +74,55 @@ public class GridIconsAccuracyTestTask : ISoloTask
             prototypes.Add(columns[0], flatData);
         }
         #endregion
+        return session;
+    }
 
-        using var ra0 = CaptureToRectArea();
-        GridScreenParams gridParams = GridScreenParams.Templates[this.gridScreenName];
-        Rect gridRoi = gridParams.GetRect(ra0);
+    public async Task Start(CancellationToken ct)
+    {
+        this.ct = ct;
+
+        switch (this.gridScreenName)
+        {
+            case GridScreenName.Weapons:
+            case GridScreenName.Artifacts:
+            case GridScreenName.CharacterDevelopmentItems:
+            case GridScreenName.Food:
+            case GridScreenName.Materials:
+            case GridScreenName.Gadget:
+            case GridScreenName.Quest:
+            case GridScreenName.PreciousItems:
+            case GridScreenName.Furnishings:
+                await new ReturnMainUiTask().Start(ct);
+                await AutoArtifactSalvageTask.OpenInventory(this.gridScreenName, this.input, this.logger, this.ct);
+                break;
+            default:
+                logger.LogInformation("{name}暂不支持自动打开，请提前手动打开界面", gridScreenName.GetDescription());
+                break;
+        }
+
+        using InferenceSession session = LoadModel(out Dictionary<string, float[]> prototypes);
 
         int count = this.maxNumToTest ?? int.MaxValue;
         double total_acc = 0.0;
         double total_count = 0;
 
-        GridScreen gridScreen = new GridScreen(gridRoi, gridParams, this.logger, this.ct);
+        GridScreen gridScreen = new GridScreen(GridParams.Templates[this.gridScreenName], this.logger, this.ct);
         await foreach (ImageRegion itemRegion in gridScreen)
         {
             itemRegion.Click();
             Task task1 = Delay(300, ct);
-            var sadf = task1.Status;
 
             // 用模型推理得到的结果
             Task<(string, int)> task2 = Task.Run(() =>
             {
-                return Infer(itemRegion.SrcMat, session, prototypes);
+                using Mat icon = itemRegion.SrcMat.GetGridIcon();
+                return Infer(icon, session, prototypes);
             }, ct);
 
             await Task.WhenAll(task1, task2);
             (string, int) result = task2.Result;
+            string predName = result.Item1;
+            int predStarNum = result.Item2;
 
             // 用CV方法得到的结果
             using var ra1 = CaptureToRectArea();
@@ -101,14 +135,14 @@ public class GridIconsAccuracyTestTask : ISoloTask
 
             // 统计结果
             total_count++;
-            if (itemName.Contains(result.Item1) && result.Item2 == itemStarNum)
+            if (itemName.Contains(predName) && predStarNum == itemStarNum)
             {
                 total_acc++;
-                logger.LogInformation($"{result.Item1}|{result.Item2}星，✔，正确率{total_acc / total_count:0.00}");
+                logger.LogInformation($"{predName}|{predStarNum}星，✔，正确率{total_acc / total_count:0.00}");
             }
             else
             {
-                logger.LogInformation($"{result.Item1}|{result.Item2}星，应为：{itemName}|{itemStarNum}星，❌，正确率{total_acc / total_count:0.00}");
+                logger.LogInformation($"{predName}|{predStarNum}星，应为：{itemName}|{itemStarNum}星，❌，正确率{total_acc / total_count:0.00}");
             }
 
             count--;
@@ -120,11 +154,21 @@ public class GridIconsAccuracyTestTask : ISoloTask
         }
     }
 
-    // todo: 单元测试
+    /// <summary>
+    /// 请自行裁剪缩放到125*125尺寸
+    /// </summary>
+    /// <param name="mat"></param>
+    /// <param name="session"></param>
+    /// <param name="prototypes"></param>
+    /// <returns>(预测名称, 预测星级)</returns>
+    /// <exception cref="Exception"></exception>
     public static (string, int) Infer(Mat mat, InferenceSession session, Dictionary<string, float[]> prototypes)
     {
-        using Mat resized = mat.Resize(new Size(125, 153));
-        using Mat rgb = resized.CvtColor(ColorConversionCodes.BGR2RGB);
+        if (mat.Size().Width != 125 || mat.Size().Height != 125)
+        {
+            throw new ArgumentOutOfRangeException(nameof(mat), "输入图像尺寸应为125*125");
+        }
+        using Mat rgb = mat.CvtColor(ColorConversionCodes.BGR2RGB);
         var tensor = new DenseTensor<float>(new[] { 1, 3, rgb.Height, rgb.Width });  // todo 放到BgiOnnxFactory那边去做个Mat->NamedOnnxValue的通用方法？
         for (int y = 0; y < rgb.Height; y++)
         {
@@ -135,7 +179,7 @@ public class GridIconsAccuracyTestTask : ISoloTask
                 tensor[0, 2, y, x] = rgb.At<Vec3b>(y, x)[2] / 255f;
             }
         }
-        var inputs = new List<NamedOnnxValue> { NamedOnnxValue.CreateFromTensor("input", tensor) };
+        var inputs = new List<NamedOnnxValue> { NamedOnnxValue.CreateFromTensor("input_image", tensor) };
         using var results = session.Run(inputs);
         float[] feature_matrix = results[0].AsEnumerable<float>().ToArray();
         string? pred_name = null;
